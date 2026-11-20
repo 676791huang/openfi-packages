@@ -41,7 +41,9 @@ jobs:
           make defconfig
           make -j"$(nproc)" package/openfi-lib/compile V=s
           make -j"$(nproc)" package/luci-app-openfi-fan/compile V=s
-          find bin/packages -type f \( -name '*.apk' -o -name '*.ipk' \) | tee /tmp/pkgs.txt
+          # 只要这两个包（绝对路径，后面在仓库根目录收集）
+          find "$PWD/bin/packages" -type f \( -name 'openfi-lib-*.apk' -o -name 'luci-app-openfi-fan-*.apk' \) | tee /tmp/pkgs.txt
+          [ -s /tmp/pkgs.txt ] || { echo '::error::没编出 .apk'; exit 1; }
 
       - name: 收集产物
         run: |
