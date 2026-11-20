@@ -25,7 +25,26 @@ jobs:
       - name: 下载并解开 SDK
         run: |
           set -euo pipefail
-          curl -fL --retry 3 -o /tmp/sdk.tar.zst "$SDK_URL"
+          FILE="${SDK_URL##*/}"
+          URLS=(
+            "$SDK_URL"
+            "https://mirror.nju.edu.cn/immortalwrt/snapshots/targets/mediatek/filogic/$FILE"
+          )
+          ok=0
+          for url in "${URLS[@]}"; do
+            echo "::group::下载 $url"
+            if timeout 420 curl -fL --retry 3 --retry-delay 5 --connect-timeout 20 \
+                 --speed-time 60 --speed-limit 1024 -o /tmp/sdk.tar.zst "$url" \
+               && tar --zstd -tf /tmp/sdk.tar.zst >/dev/null 2>&1; then
+              echo "✅ $(basename "$url")"
+              ok=1
+              echo "::endgroup::"
+              break
+            fi
+            echo "⚠️ 这个源不可用，换下一个"
+            echo "::endgroup::"
+          done
+          [ "$ok" = 1 ] || { echo "::error::SDK 下载失败（官方和镜像都不可用）"; exit 1; }
           mkdir -p sdk
           tar --zstd -xf /tmp/sdk.tar.zst -C sdk --strip-components=1
           ls sdk | head
