@@ -322,6 +322,7 @@ static struct temp_cfg g_tc;
 static struct fan_state g_st;
 static int g_applied = -1;
 static struct ubus_context *g_ubus;
+static struct uloop_timeout g_sample;
 
 struct fan_snap {
 	int output;
@@ -580,8 +581,6 @@ static void fan_iteration(void)
 	write_state(&g_rc, &g_st, &g_tc, g_snap.temps, g_snap.unified, g_applied);
 }
 
-static struct uloop_timeout g_sample;
-
 static void fan_tick(struct uloop_timeout *t)
 {
 	if (g_stop) {
@@ -599,19 +598,18 @@ static void fan_tick(struct uloop_timeout *t)
 	uloop_timeout_set(t, g_rc.period * 1000);
 }
 
-static struct uloop_signal g_sig_term = { .signo = SIGTERM };
-static struct uloop_signal g_sig_int  = { .signo = SIGINT };
-static struct uloop_signal g_sig_hup  = { .signo = SIGHUP };
-
 static void on_uloop_signal(struct uloop_signal *s)
 {
 	if (s->signo == SIGHUP)
 		g_reload = 1;
 	else
 		g_stop = 1;
-	if (g_sample.cb)
-		uloop_timeout_set(&g_sample, 0);
+	uloop_timeout_set(&g_sample, 0);
 }
+
+static struct uloop_signal g_sig_term = { .signo = SIGTERM, .cb = on_uloop_signal };
+static struct uloop_signal g_sig_int  = { .signo = SIGINT,  .cb = on_uloop_signal };
+static struct uloop_signal g_sig_hup  = { .signo = SIGHUP,  .cb = on_uloop_signal };
 
 static int ubus_start(void)
 {
@@ -772,9 +770,9 @@ int main(int argc, char **argv)
 	uloop_init();
 	if (ubus_start() != 0)
 		olog_warn("继续以无 ubus 模式运行");
-	uloop_signal_add(&g_sig_term, on_uloop_signal);
-	uloop_signal_add(&g_sig_int, on_uloop_signal);
-	uloop_signal_add(&g_sig_hup, on_uloop_signal);
+	uloop_signal_add(&g_sig_term);
+	uloop_signal_add(&g_sig_int);
+	uloop_signal_add(&g_sig_hup);
 
 	olog_info("启动:曲线 %d/%d/%d/%d → %d/%d/%d/%d,周期 %ds,静默=%d",
 		  g_rc.curve.t1, g_rc.curve.t2, g_rc.curve.t3, g_rc.curve.t4,
