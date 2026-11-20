@@ -25,6 +25,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <libubox/blobmsg.h>
+#include <libubox/uloop.h>
+#include <libubus.h>
+
 #include "openfi_fanctl.h"
 #include "openfi_json.h"
 #include "openfi_log.h"
@@ -40,9 +44,6 @@
 
 static volatile sig_atomic_t g_stop;
 static volatile sig_atomic_t g_reload;
-
-static void on_term(int sig) { (void)sig; g_stop = 1; }
-static void on_hup(int sig)  { (void)sig; g_reload = 1; }
 
 static long long now_ms(void)
 {
@@ -314,6 +315,322 @@ static int selftest(const struct fan_run_cfg *rc, const struct temp_cfg *tc)
 	return bad ? 1 : 0;
 }
 
+/* ---------------- ubus 服务 ---------------- */
+
+static struct fan_run_cfg g_rc;
+static struct temp_cfg g_tc;
+static struct fan_state g_st;
+static int g_applied = -1;
+static struct ubus_context *g_ubus;
+
+struct fan_snap {
+	int output;
+	int target;
+	int unified;
+	int temps[TEMP_SRC_COUNT];
+	int silent;
+	int ok;
+	char reason[32];
+};
+static struct fan_snap g_snap = { .output = -1, .target = -1, .ok = 1, .unified = TEMP_INVALID };
+
+static const char *temp_name(int i)
+{
+	static const char *nm[TEMP_SRC_COUNT] = { "cpu", "wifi", "modem" };
+
+	return (i >= 0 && i < TEMP_SRC_COUNT) ? nm[i] : "?";
+}
+
+static void snap_refresh(void)
+{
+	g_snap.output = g_applied;
+	g_snap.target = g_st.last_applied;
+	g_snap.silent = g_st.silent;
+	snprintf(g_snap.reason, sizeof(g_snap.reason), "%s",
+		 fan_reason_str(g_st.last_reason));
+}
+
+static void snap_fill(struct blob_buf *b, int with_config)
+{
+	blobmsg_add_u32(b, "output", g_snap.output < 0 ? 0 : g_snap.output);
+	blobmsg_add_u32(b, "target", g_snap.target < 0 ? 0 : g_snap.target);
+	blobmsg_add_string(b, "reason", g_snap.reason);
+	blobmsg_add_u8(b, "silent", g_snap.silent ? 1 : 0);
+	blobmsg_add_u8(b, "ok", g_snap.ok ? 1 : 0);
+	blobmsg_add_u8(b, "manual", !strcmp(ouci_get_def("openfi_fan", "fan", "mode", "auto"), "manual"));
+	if (g_snap.unified != TEMP_INVALID)
+		blobmsg_add_u32(b, "temp", g_snap.unified);
+	for (int i = 0; i < TEMP_SRC_COUNT; i++)
+		if (g_snap.temps[i] != TEMP_INVALID)
+			blobmsg_add_u32(b, temp_name(i), g_snap.temps[i]);
+
+	if (!with_config)
+		return;
+	blobmsg_add_u32(b, "period", g_rc.period);
+	blobmsg_add_u32(b, "min_speed", g_rc.curve.min_speed);
+	blobmsg_add_u32(b, "emergency_temp", g_rc.curve.emergency_temp);
+	blobmsg_add_u32(b, "silent_max_temp", g_rc.silent_max_temp);
+	blobmsg_add_u32(b, "temp1", g_rc.curve.t1);
+	blobmsg_add_u32(b, "temp2", g_rc.curve.t2);
+	blobmsg_add_u32(b, "temp3", g_rc.curve.t3);
+	blobmsg_add_u32(b, "temp4", g_rc.curve.t4);
+	blobmsg_add_u32(b, "speed1", g_rc.curve.s1);
+	blobmsg_add_u32(b, "speed2", g_rc.curve.s2);
+	blobmsg_add_u32(b, "speed3", g_rc.curve.s3);
+	blobmsg_add_u32(b, "speed4", g_rc.curve.s4);
+	blobmsg_add_u32(b, "manual_speed",
+			(int)ouci_get_int("openfi_fan", "fan", "manual_speed", 50));
+}
+
+static int fan_ubus_status(struct ubus_context *ctx, struct ubus_object *obj,
+			   struct ubus_request_data *req, const char *method,
+			   struct blob_attr *msg)
+{
+	struct blob_buf b = {};
+
+	(void)obj; (void)method; (void)msg;
+	blob_buf_init(&b, 0);
+	snap_fill(&b, 0);
+	ubus_send_reply(ctx, req, b.head);
+	blob_buf_free(&b);
+	return 0;
+}
+
+static int fan_ubus_get_config(struct ubus_context *ctx, struct ubus_object *obj,
+			       struct ubus_request_data *req, const char *method,
+			       struct blob_attr *msg)
+{
+	struct blob_buf b = {};
+
+	(void)obj; (void)method; (void)msg;
+	blob_buf_init(&b, 0);
+	snap_fill(&b, 1);
+	ubus_send_reply(ctx, req, b.head);
+	blob_buf_free(&b);
+	return 0;
+}
+
+enum {
+	CF_T1, CF_T2, CF_T3, CF_T4,
+	CF_S1, CF_S2, CF_S3, CF_S4,
+	CF_PERIOD, CF_MIN_SPEED, CF_EMERGENCY, CF_SILENT_MAX,
+	CF_MODE, CF_MANUAL_SPEED,
+	__CF_MAX
+};
+
+static const struct blobmsg_policy cfg_policy[__CF_MAX] = {
+	[CF_T1] = { .name = "temp1", .type = BLOBMSG_TYPE_INT32 },
+	[CF_T2] = { .name = "temp2", .type = BLOBMSG_TYPE_INT32 },
+	[CF_T3] = { .name = "temp3", .type = BLOBMSG_TYPE_INT32 },
+	[CF_T4] = { .name = "temp4", .type = BLOBMSG_TYPE_INT32 },
+	[CF_S1] = { .name = "speed1", .type = BLOBMSG_TYPE_INT32 },
+	[CF_S2] = { .name = "speed2", .type = BLOBMSG_TYPE_INT32 },
+	[CF_S3] = { .name = "speed3", .type = BLOBMSG_TYPE_INT32 },
+	[CF_S4] = { .name = "speed4", .type = BLOBMSG_TYPE_INT32 },
+	[CF_PERIOD] = { .name = "period", .type = BLOBMSG_TYPE_INT32 },
+	[CF_MIN_SPEED] = { .name = "min_speed", .type = BLOBMSG_TYPE_INT32 },
+	[CF_EMERGENCY] = { .name = "emergency_temp", .type = BLOBMSG_TYPE_INT32 },
+	[CF_SILENT_MAX] = { .name = "silent_max_temp", .type = BLOBMSG_TYPE_INT32 },
+	[CF_MODE] = { .name = "mode", .type = BLOBMSG_TYPE_STRING },
+	[CF_MANUAL_SPEED] = { .name = "manual_speed", .type = BLOBMSG_TYPE_INT32 },
+};
+
+static int fan_ubus_set_config(struct ubus_context *ctx, struct ubus_object *obj,
+			       struct ubus_request_data *req, const char *method,
+			       struct blob_attr *msg)
+{
+	struct blob_attr *tb[__CF_MAX];
+	char v[32];
+	int err = 0;
+
+	(void)obj; (void)method;
+	if (!msg)
+		return UBUS_STATUS_INVALID_ARGUMENT;
+	blobmsg_parse(cfg_policy, __CF_MAX, tb, blob_data(msg), blob_len(msg));
+
+	if (tb[CF_MODE])
+		err |= ouci_set("openfi_fan", "fan", "mode",
+				blobmsg_get_string(tb[CF_MODE]));
+
+#define SET_I(id, key) do {						\
+	if (tb[id]) {							\
+		snprintf(v, sizeof(v), "%d", (int)blobmsg_get_u32(tb[id])); \
+		err |= ouci_set("openfi_fan", "fan", key, v);		\
+	}								\
+} while (0)
+	SET_I(CF_T1, "temp1");
+	SET_I(CF_T2, "temp2");
+	SET_I(CF_T3, "temp3");
+	SET_I(CF_T4, "temp4");
+	SET_I(CF_S1, "speed1");
+	SET_I(CF_S2, "speed2");
+	SET_I(CF_S3, "speed3");
+	SET_I(CF_S4, "speed4");
+	SET_I(CF_PERIOD, "period");
+	SET_I(CF_MIN_SPEED, "min_speed");
+	SET_I(CF_EMERGENCY, "emergency_temp");
+	SET_I(CF_SILENT_MAX, "silent_max_temp");
+	SET_I(CF_MANUAL_SPEED, "manual_speed");
+#undef SET_I
+
+	if (err) {
+		olog_warn("ubus set_config 部分写入失败");
+		return UBUS_STATUS_UNKNOWN_ERROR;
+	}
+	/* 下一轮立刻重读配置并生效，不用重启服务 */
+	g_reload = 1;
+	if (g_sample.cb)
+		uloop_timeout_set(&g_sample, 0);
+	ubus_send_reply(ctx, req, NULL);
+	return 0;
+}
+
+enum { SL_ENABLE };
+static const struct blobmsg_policy silent_policy[1] = {
+	[SL_ENABLE] = { .name = "enable", .type = BLOBMSG_TYPE_INT32 },
+};
+
+static int fan_ubus_silent(struct ubus_context *ctx, struct ubus_object *obj,
+			   struct ubus_request_data *req, const char *method,
+			   struct blob_attr *msg)
+{
+	struct blob_attr *tb[1];
+	struct blob_buf b = {};
+
+	(void)obj; (void)method;
+	blobmsg_parse(silent_policy, 1, tb, msg ? blob_data(msg) : NULL,
+		      msg ? blob_len(msg) : 0);
+	if (tb[SL_ENABLE]) {
+		int on = (int)blobmsg_get_u32(tb[SL_ENABLE]);
+
+		fan_state_set_silent(&g_st, on ? 1 : 0);
+		g_snap.silent = on ? 1 : 0;
+		g_applied = -1;		/* 强制下一轮重新下发 PWM */
+		if (g_sample.cb)
+			uloop_timeout_set(&g_sample, 0);
+	}
+	blob_buf_init(&b, 0);
+	blobmsg_add_u8(&b, "silent", g_snap.silent ? 1 : 0);
+	ubus_send_reply(ctx, req, b.head);
+	blob_buf_free(&b);
+	return 0;
+}
+
+static const struct ubus_method g_fan_methods[] = {
+	UBUS_METHOD_NOARG("status", fan_ubus_status),
+	UBUS_METHOD_NOARG("get_config", fan_ubus_get_config),
+	UBUS_METHOD("set_config", fan_ubus_set_config, cfg_policy),
+	UBUS_METHOD("silent", fan_ubus_silent, silent_policy),
+};
+
+static struct ubus_object_type g_fan_obj_type =
+	UBUS_OBJECT_TYPE("openfi-fan", g_fan_methods);
+
+static struct ubus_object g_fan_obj = {
+	.name = "openfi.fan",
+	.type = &g_fan_obj_type,
+	.methods = g_fan_methods,
+	.n_methods = ARRAY_SIZE(g_fan_methods),
+};
+
+/* ---------------- 采样 / 主循环 ---------------- */
+
+static void fan_iteration(void)
+{
+	int got = temp_read_all(&g_tc, g_snap.temps, &g_snap.unified);
+	int sl = sw_is_silent(sw_read_level(NULL, "func"), g_rc.silent_when_hi);
+	const char *mode = ouci_get_def("openfi_fan", "fan", "mode", "auto");
+	int want = -1;
+
+	/* 物理开关每轮都看：拨动后最多一个周期生效 */
+	if (sl >= 0)
+		fan_state_set_silent(&g_st, sl);
+
+	if (!strcmp(mode, "manual")) {
+		int ms = (int)ouci_get_int("openfi_fan", "fan", "manual_speed", 50);
+
+		if (ms < 0) ms = 0;
+		if (ms > 100) ms = 100;
+		want = ms;
+		/* 安全优先：静默档停机；过热强制满速 */
+		if (g_st.silent)
+			want = 0;
+		if (g_snap.unified != TEMP_INVALID &&
+		    g_snap.unified >= g_rc.curve.emergency_temp)
+			want = 100;
+	} else {
+		want = fan_state_step(&g_st, g_snap.unified, now_ms());
+	}
+
+	if (want >= 0 && want != g_applied) {
+		if (pwm_apply(&g_rc, want) != 0) {
+			olog_err("PWM 下发失败(转速 %d)", want);
+			g_snap.ok = 0;
+		} else {
+			g_applied = want;
+			g_snap.ok = 1;
+			olog_info("转速 → %d%%（%s，温度 %d℃，读到 %d 路）",
+				  want, fan_reason_str(g_st.last_reason),
+				  g_snap.unified == TEMP_INVALID ? -1 : g_snap.unified,
+				  got);
+		}
+	}
+
+	snap_refresh();
+	write_state(&g_rc, &g_st, &g_tc, g_snap.temps, g_snap.unified, g_applied);
+}
+
+static struct uloop_timeout g_sample;
+
+static void fan_tick(struct uloop_timeout *t)
+{
+	if (g_stop) {
+		uloop_end();
+		return;
+	}
+	if (g_reload) {
+		g_reload = 0;
+		olog_info("重读配置");
+		cfg_load(&g_rc);
+		fan_state_init(&g_st, &g_rc.curve, g_rc.silent_max_temp);
+		g_applied = -1;
+	}
+	fan_iteration();
+	uloop_timeout_set(t, g_rc.period * 1000);
+}
+
+static struct uloop_signal g_sig_term = { .signo = SIGTERM };
+static struct uloop_signal g_sig_int  = { .signo = SIGINT };
+static struct uloop_signal g_sig_hup  = { .signo = SIGHUP };
+
+static void on_uloop_signal(struct uloop_signal *s)
+{
+	if (s->signo == SIGHUP)
+		g_reload = 1;
+	else
+		g_stop = 1;
+	if (g_sample.cb)
+		uloop_timeout_set(&g_sample, 0);
+}
+
+static int ubus_start(void)
+{
+	g_ubus = ubus_connect(NULL);
+	if (!g_ubus) {
+		olog_warn("ubus 连接失败，状态服务不可用（--status 仍可用）");
+		return -1;
+	}
+	ubus_add_uloop(g_ubus);
+	if (ubus_add_object(g_ubus, &g_fan_obj) != 0) {
+		olog_warn("注册 ubus 对象 openfi.fan 失败");
+		ubus_free(g_ubus);
+		g_ubus = NULL;
+		return -1;
+	}
+	olog_info("ubus 对象 openfi.fan 已注册");
+	return 0;
+}
+
 /* ---------------- main ---------------- */
 
 static void usage(void)
@@ -324,9 +641,8 @@ static void usage(void)
 		"  --once        跑一轮就退出\n"
 		"  --json        输出状态 JSON\n"
 		"  --speed N     手动设转速 0..100\n"
-		"  --selftest    上机自检\n"
-		"  --speed N     固定转速 N%%(写进配置持久生效)\n"
 		"  --speed auto  回到温度曲线\n"
+		"  --selftest    上机自检\n"
 		"  -h, --help    本帮助\n");
 }
 
@@ -344,11 +660,6 @@ int main(int argc, char **argv)
 	int opt_once = 0, opt_json = 0, opt_selftest = 0, opt_speed = -1;
 	int opt_speed_auto = 0;
 	int opt_status = 0;
-	struct fan_run_cfg rc;
-	struct temp_cfg tc;
-	struct fan_state st;
-	int temps[TEMP_SRC_COUNT], unified;
-	int applied = -1;
 	int rc_code = 0;
 
 	while (1) {
@@ -362,15 +673,12 @@ int main(int argc, char **argv)
 		case 'j': opt_json = 1; opt_once = 1; break;
 		case 't': opt_selftest = 1; opt_once = 1; break;
 		case 's':
-			/* --speed auto 表示"回到温度曲线" */
 			if (!strcmp(optarg, "auto")) {
 				opt_speed_auto = 1;
 			} else {
 				opt_speed = atoi(optarg);
-				if (opt_speed < 0)
-					opt_speed = 0;
-				if (opt_speed > 100)
-					opt_speed = 100;
+				if (opt_speed < 0) opt_speed = 0;
+				if (opt_speed > 100) opt_speed = 100;
 			}
 			opt_once = 1;
 			break;
@@ -379,12 +687,6 @@ int main(int argc, char **argv)
 	}
 
 	olog_init("openfi-fan");
-	/*
-	 * 【可测性】允许用环境变量把 sysfs / UCI 的根换掉。
-	 * 于是开发机上可以造一棵假的 pwmchip + 假的配置文件,
-	 * 把整个守护进程(含 PWM 写入、JSON 输出)真跑一遍 ——
-	 * 而不是只能上机看风扇转不转。
-	 */
 	{
 		const char *r = getenv("OPENFI_SYSFS_ROOT");
 
@@ -394,27 +696,18 @@ int main(int argc, char **argv)
 		if (r && *r)
 			ouci_set_root(r);
 	}
-	cfg_load(&rc);
-	temp_cfg_default(&tc);
-	/* UCI 里可以覆盖温度来源(方便别的板子/调试) */
+	cfg_load(&g_rc);
+	temp_cfg_default(&g_tc);
 	{
-		/*
-		 * ★ 注意:ouci_get_def 在配置项缺失时【返回传进去的默认值指针】。
-		 * 如果默认值就是目标缓冲区本身,再 snprintf 回去就是"自己拷自己"
-		 * ——重叠拷贝属于未定义行为,实测会把缓冲区内容搅坏
-		 * (JSON 里冒出控制字符就是这个引起的)。
-		 * 所以先读进临时缓冲,再赋值。
-		 */
-		char tmp[sizeof(tc.wifi_iface)];
+		char tmp[sizeof(g_tc.wifi_iface)];
 		const char *p = ouci_get_def("openfi_fan", "fan", "wifi_iface", "ra0");
 
 		snprintf(tmp, sizeof(tmp), "%s", p);
-		memcpy(tc.wifi_iface, tmp, sizeof(tmp));
-		tc.wifi_enabled = ouci_get_bool("openfi_fan", "fan", "wifi_temp", 1);
+		memcpy(g_tc.wifi_iface, tmp, sizeof(tmp));
+		g_tc.wifi_enabled = ouci_get_bool("openfi_fan", "fan", "wifi_temp", 1);
 	}
 
-	/* --status:只把上次写的状态文件读出来打印,不读温度、不碰 PWM ——
-	   LuCI 每几秒轮询一次,绝不能有副作用。 */
+	/* --status：只读上次的状态文件，不读温度、不碰 PWM */
 	if (opt_status) {
 		char *buf = malloc(4096);
 
@@ -429,35 +722,27 @@ int main(int argc, char **argv)
 	}
 
 	if (opt_selftest)
-		return selftest(&rc, &tc);
+		return selftest(&g_rc, &g_tc);
 
-	if (fan_state_init(&st, &rc.curve, rc.silent_max_temp) != 0) {
+	(void)opt_json;	/* --json 走 write_state() 的 stdout 输出 */
+
+	if (fan_state_init(&g_st, &g_rc.curve, g_rc.silent_max_temp) != 0) {
 		olog_warn("状态机初始化失败(配置非法),用默认曲线重来");
-		fan_cfg_default(&rc.curve, 10);
-		if (fan_state_init(&st, &rc.curve, rc.silent_max_temp) != 0) {
+		fan_cfg_default(&g_rc.curve, 10);
+		if (fan_state_init(&g_st, &g_rc.curve, g_rc.silent_max_temp) != 0) {
 			olog_err("还是失败,退出");
 			return 1;
 		}
 	}
-	/*
-	 * 静默档:直接读物理开关电平。
-	 * 【不再依赖 /var/run/openfi-silent 标志文件】——
-	 * 那个文件只在按键事件发生时更新,重启后若没人拨过开关就是空的,
-	 * 而实际开关可能正停在静默档。每轮读电平则天然正确。
-	 */
 	{
-		int sl = sw_is_silent(sw_read_level(NULL, "func"), rc.silent_when_hi);
+		int sl = sw_is_silent(sw_read_level(NULL, "func"), g_rc.silent_when_hi);
 
 		if (sl >= 0)
-			st.silent = sl;
-		olog_info("启动时的开关状态:%s", st.silent ? "静默档" : "正常档");
+			g_st.silent = sl;
+		olog_info("启动时的开关状态:%s", g_st.silent ? "静默档" : "正常档");
 	}
 
 	if (opt_speed_auto) {
-		/*
-		 * 回到温度曲线。清掉 manual_speed 并把 mode 改回 auto ——
-		 * 只改 mode 也行,但把速度一并清掉,免得界面上的旧值造成误解。
-		 */
 		if (ouci_set("openfi_fan", "fan", "mode", "auto") != 0)
 			return oj_fail("写配置失败");
 		olog_info("已回到温度曲线");
@@ -465,98 +750,49 @@ int main(int argc, char **argv)
 	}
 
 	if (opt_speed >= 0) {
-		/*
-		 * ★ 以前这里只是"写一次 PWM 然后退出"。
-		 *   问题是守护进程每个周期都会按状态机重新计算并覆盖 PWM ——
-		 *   温度一动(几秒到几十秒)用户的设置就没了,而且状态页显示的
-		 *   还是守护进程缓存的值,看起来"设了没反应"。
-		 *   现在把选择写进配置:守护进程按 mode=manual + manual_speed 走,
-		 *   一直到用户显式改回 auto 为止;顺手也立刻写一次,
-		 *   不用等到下个周期。
-		 */
 		char buf[16];
 
-		/*
-		 * ★ 顺序很重要:先写 PWM(立刻见效),再持久化配置。
-		 *   反过来的话,配置写不进去(比如配置文件所在的分区只读、
-		 *   或者跑在没有配置根目录的测试环境里)就直接返回了,
-		 *   PWM 根本没动 —— 用户看到的现象是"点了没反应"。
-		 *   配置只是"下次重启后还记得",写失败不该拦住当前动作。
-		 */
-		if (pwm_apply(&rc, opt_speed) != 0)
+		if (pwm_apply(&g_rc, opt_speed) != 0)
 			return oj_fail("PWM 写入失败");
-
 		snprintf(buf, sizeof(buf), "%d", opt_speed);
 		if (ouci_set("openfi_fan", "fan", "mode", "manual") != 0 ||
 		    ouci_set("openfi_fan", "fan", "manual_speed", buf) != 0)
 			olog_warn("转速已生效,但写配置失败 —— 重启后会回到温度曲线");
 		else
-			olog_info("已固定转速 %d%%(写进配置,改回请用 --speed auto)", opt_speed);
+			olog_info("已固定转速 %d%%(改回请用 --speed auto)", opt_speed);
 		return 0;
 	}
 
-	signal(SIGTERM, on_term);
-	signal(SIGINT, on_term);
-	signal(SIGHUP, on_hup);
-	signal(SIGPIPE, SIG_IGN);
+	if (opt_once) {
+		fan_iteration();
+		return rc_code;
+	}
+
+	/* 守护进程：uloop + ubus */
+	uloop_init();
+	if (ubus_start() != 0)
+		olog_warn("继续以无 ubus 模式运行");
+	uloop_signal_add(&g_sig_term, on_uloop_signal);
+	uloop_signal_add(&g_sig_int, on_uloop_signal);
+	uloop_signal_add(&g_sig_hup, on_uloop_signal);
 
 	olog_info("启动:曲线 %d/%d/%d/%d → %d/%d/%d/%d,周期 %ds,静默=%d",
-		  rc.curve.t1, rc.curve.t2, rc.curve.t3, rc.curve.t4,
-		  rc.curve.s1, rc.curve.s2, rc.curve.s3, rc.curve.s4,
-		  rc.period, st.silent);
+		  g_rc.curve.t1, g_rc.curve.t2, g_rc.curve.t3, g_rc.curve.t4,
+		  g_rc.curve.s1, g_rc.curve.s2, g_rc.curve.s3, g_rc.curve.s4,
+		  g_rc.period, g_st.silent);
 
-	for (;;) {
-		int got = temp_read_all(&tc, temps, &unified);
-		int want;
+	g_sample.cb = fan_tick;
+	uloop_timeout_set(&g_sample, 10);
+	uloop_run();
 
-		/* 每轮再看一眼物理开关(一次小文件读,代价可忽略)。
-		   这样开关拨动后最多等一个周期就生效 —— 即使没收到按键事件
-		   (比如事件被别的程序抢消费掉了)也不会卡在旧状态。 */
-		{
-			int sl = sw_is_silent(sw_read_level(NULL, "func"), rc.silent_when_hi);
-
-			if (sl >= 0)
-				fan_state_set_silent(&st, sl);
-		}
-
-		if (opt_once && opt_json)
-			applied = st.last_applied;
-		want = fan_state_step(&st, unified, now_ms());
-		if (want >= 0 && want != applied) {
-			if (pwm_apply(&rc, want) != 0) {
-				olog_err("PWM 下发失败(转速 %d)", want);
-				rc_code = 1;
-			} else {
-				applied = want;
-				olog_info("转速 → %d%%(原因 %s,温度 %d℃,读到 %d 路)",
-					  want, fan_reason_str(st.last_reason),
-					  unified == TEMP_INVALID ? -1 : unified, got);
-			}
-		}
-
-		write_state(&rc, &st, &tc, temps, unified, applied);
-		if (opt_once)
-			break;
-
-		/* 分片睡眠:好让信号能及时进来(SIGHUP 要立刻重判) */
-		for (int i = 0; i < rc.period * 10 && !g_stop && !g_reload; i++)
-			usleep(100 * 1000);
-
-		if (g_reload) {
-			g_reload = 0;
-			olog_info("收到 SIGHUP:重新读配置");
-			cfg_load(&rc);
-			fan_state_init(&st, &rc.curve, rc.silent_max_temp);
-			applied = -1;
-		}
-		if (g_stop)
-			break;
+	/* 退出前把风扇开到全速 */
+	olog_info("退出:把风扇开到全速以保证散热");
+	pwm_apply(&g_rc, 100);
+	if (g_ubus) {
+		ubus_free(g_ubus);
+		g_ubus = NULL;
 	}
-
-	if (!opt_once) {
-		/* 退出前把风扇开到【全速】——守护进程挂了也不能让板子过热 */
-		olog_info("收到停止信号:退出前把风扇开到全速以保证散热");
-		pwm_apply(&rc, 100);
-	}
+	if (g_snap.ok == 0 && rc_code == 0)
+		rc_code = 0;
 	return rc_code;
 }

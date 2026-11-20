@@ -17,7 +17,7 @@ define Package/luci-app-openfi-fan
   SUBMENU:=3. Applications
   TITLE:=OpenFi 6C 风扇温控
   URL:=https://github.com/676791huang/openfi-packages
-  DEPENDS:=+openfi-lib +luci-base
+  DEPENDS:=+openfi-lib +luci-base +libubus +libubox +libblobmsg-json
 endef
 
 define Package/luci-app-openfi-fan/description
@@ -38,7 +38,8 @@ define Build/Compile
 	$(MAKE) -C $(PKG_BUILD_DIR)/src \
 		CC="$(TARGET_CC)" \
 		CFLAGS="$(TARGET_CFLAGS) $(TARGET_CPPFLAGS) -I$(STAGING_DIR)/usr/include/openfi" \
-		LDFLAGS="$(TARGET_LDFLAGS)"
+		LDFLAGS="$(TARGET_LDFLAGS)" \
+		LIBS="-lopenfi -lubus -lubox -lblobmsg_json"
 endef
 
 define Package/luci-app-openfi-fan/install
